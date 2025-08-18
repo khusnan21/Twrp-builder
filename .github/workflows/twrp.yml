@@ -1,0 +1,126 @@
+name: Build TWRP Vendorboot for P1102GT
+
+on:
+  workflow_dispatch:
+    inputs:
+      brand:
+        description: "Device brand"
+        required: true
+        default: "itel"
+      device:
+        description: "Device codename"
+        required: true
+        default: "P1102GT"
+      branch:
+        description: "Branch TWRP source"
+        required: true
+        default: "twrp-12.1"
+      device_repo:
+        description: "Device tree repository"
+        required: true
+        default: "https://github.com/khusnan21/twrp-device_itel_P1102GT"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Cleanup
+        uses: rokibhasansagar/slimhub_actions@main
+
+      - name: Set Swap Space
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 24
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install minimal deps + repo tool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git-core curl bc build-essential zip unzip rsync python3 ccache
+          mkdir -p "$HOME/bin"
+          curl -L https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/bin/repo"
+          chmod a+x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Install Java 11
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: "11"
+
+      - name: Sync TWRP Source
+        run: |
+          mkdir -p "$HOME/twrp" && cd "$HOME/twrp"
+          repo init -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git \
+            -b "${{ github.event.inputs.branch }}" --depth=1
+          repo sync -c --force-sync --no-clone-bundle --no-tags -j"$(nproc)"
+
+      - name: Clone Device Tree
+        run: |
+          cd "$HOME/twrp"
+          git clone "${{ github.event.inputs.device_repo }}" \
+            "device/${{ github.event.inputs.brand }}/${{ github.event.inputs.device }}"
+
+      - name: Set Build Date
+        run: |
+          echo "BUILD_DATE=$(TZ=Asia/Manila date +%Y%m%d)" >> $GITHUB_ENV
+
+      - name: Build Vendorboot
+        run: |
+          cd "$HOME/twrp"
+          source build/envsetup.sh
+          lunch "twrp_${{ github.event.inputs.device }}-eng"
+          mka vendorbootimage -j"$(nproc)"
+
+      - name: Create Flashable ZIP
+        run: |
+          OUTDIR=$HOME/twrp/out/target/product/${{ github.event.inputs.device }}
+          cd $OUTDIR
+          mkdir -p META-INF/com/google/android
+          cat > META-INF/com/google/android/updater-script <<EOF
+          ui_print("Flashing TWRP for ${{ github.event.inputs.device }}...");
+          package_extract_file("vendor_boot.img", "/dev/block/bootdevice/by-name/vendor_boot");
+          ui_print("Done!");
+          EOF
+          zip -r9 twrp-${{ github.event.inputs.device }}.zip vendor_boot.img META-INF
+
+      - name: Check if Vendorboot Exists
+        run: |
+          if [ -f $HOME/twrp/out/target/product/${{ github.event.inputs.device }}/vendor_boot.img ]; then
+              echo "CHECK_IMG_IS_OK=true" >> $GITHUB_ENV
+          else
+              echo "Recovery out directory is empty."
+          fi
+          if [ -f $HOME/twrp/out/target/product/${{ github.event.inputs.device }}/twrp-${{ github.event.inputs.device }}.zip ]; then
+              echo "CHECK_ZIP_IS_OK=true" >> $GITHUB_ENV
+          else
+              echo "Recovery ZIP out directory is empty."
+          fi
+
+      - name: Upload Vendorboot Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          path: $HOME/twrp/out/target/product/${{ github.event.inputs.device }}/vendor_boot.img
+          name: twrp-vendorboot-${{ github.event.inputs.device }}
+
+      - name: Upload Flashable ZIP Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          path: $HOME/twrp/out/target/product/${{ github.event.inputs.device }}/twrp-${{ github.event.inputs.device }}.zip
+          name: twrp-flashable-${{ github.event.inputs.device }}
+
+      - name: Upload to GitHub Release
+        if: env.CHECK_IMG_IS_OK == 'true' && env.CHECK_ZIP_IS_OK == 'true'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            $HOME/twrp/out/target/product/${{ github.event.inputs.device }}/vendor_boot.img
+            $HOME/twrp/out/target/product/${{ github.event.inputs.device }}/twrp-${{ github.event.inputs.device }}.zip
+          name: Unofficial TWRP for ${{ github.event.inputs.device }} // ${{ env.BUILD_DATE }}
+          tag_name: ${{ github.run_id }}
+          body: |
+            Build: ${{ github.event.inputs.branch }}
+            Device Tree: [${{ github.event.inputs.device_repo }}](${{ github.event.inputs.device_repo }}/tree/${{ github.event.inputs.branch }})
